@@ -1,26 +1,28 @@
-# windthrow_nowcasting/agents/cap_ingest.py
+# windthrow_nowcasting/agents/data_ingestion/cap_ingest.py
 
 """
 Usage examples:
-  # 1) Last 7 days
-  python agents/data_ingestion/cap_ingest.py --feed en --days 7
+  # 1) Last 7 days (filter by hazard window: onset..expires)
+  python agents/data_ingestion/cap_ingest.py --feed en --days 7 --time-field onset_expires --reprocess
 
   # Specific timeframe
-  python agents/data_ingestion/cap_ingest.py --feed en --start "2025-12-25T00:00:00Z" --end "2025-12-29T18:00:00Z"
+  python agents/data_ingestion/cap_ingest.py --feed en --start "2025-12-25T00:00:00Z" --end "2025-12-29T18:00:00Z" --time-field onset_expires --reprocess
 
-  # Timeframe + bbox filter
-  python agents/data_ingestion/cap_ingest.py --feed en --days 7 --bbox 24,59.5,26.5,60.7
+  # Timeframe + bbox filter (best effort via CAP polygons)
+  python agents/data_ingestion/cap_ingest.py --feed en --days 7 --bbox 24,59.5,26.5,60.7 --time-field onset_expires --reprocess
 """
 
 import os
 import time
 import json
 import argparse
-import requests
-import pandas as pd
-import xml.etree.ElementTree as ET
+from dataclasses import dataclass
 from urllib.parse import urljoin
 from datetime import datetime, timezone, timedelta
+import xml.etree.ElementTree as ET
+
+import requests
+import pandas as pd
 
 # Optional (bbox filtering using CAP polygons)
 try:
@@ -79,13 +81,21 @@ def parse_iso_utc(s: str) -> datetime:
     if s.endswith("Z"):
         s = s[:-1] + "+00:00"
     try:
-        dt = datetime.fromisoformat(s)
+        d = datetime.fromisoformat(s)
     except ValueError:
-        # try space-separated
-        dt = datetime.fromisoformat(s.replace(" ", "T"))
-    if dt.tzinfo is None:
-        dt = dt.replace(tzinfo=timezone.utc)
-    return dt.astimezone(timezone.utc)
+        d = datetime.fromisoformat(s.replace(" ", "T"))
+    if d.tzinfo is None:
+        d = d.replace(tzinfo=timezone.utc)
+    return d.astimezone(timezone.utc)
+
+
+def _parse_dt(s: str | None) -> datetime | None:
+    if not s:
+        return None
+    try:
+        return parse_iso_utc(s)
+    except Exception:
+        return None
 
 
 def parse_bbox(s: str):
@@ -142,7 +152,6 @@ def _polygon_string_to_shapely(poly_str: str):
     CAP polygon format: "lat,lon lat,lon lat,lon ..."
     Returns shapely Polygon in lon/lat order.
     """
-    # Example: "60.1,24.9 60.2,25.0 60.1,25.1 60.1,24.9"
     pts = []
     for pair in poly_str.split():
         lat_s, lon_s = pair.split(",")
@@ -166,7 +175,6 @@ def parse_cap_xml(xml_bytes: bytes) -> dict:
 
     infos = root.findall("cap:info", CAP_NS)
 
-    # first info block for key structured fields
     language = event = severity = urgency = certainty = onset = expires = effective = None
     area_desc = None
 
@@ -221,24 +229,6 @@ def parse_cap_xml(xml_bytes: bytes) -> dict:
     }
 
 
-def _time_in_window(sent_iso: str | None, start: datetime | None, end: datetime | None) -> bool:
-    if start is None and end is None:
-        return True
-    if not sent_iso:
-        return True  # if missing, keep (or you can drop; but keep is safer)
-
-    try:
-        sent_dt = parse_iso_utc(sent_iso)
-    except Exception:
-        return True
-
-    if start and sent_dt < start:
-        return False
-    if end and sent_dt > end:
-        return False
-    return True
-
-
 def _bbox_match(polygons: list[str], bbox_tuple) -> bool | None:
     """
     Returns:
@@ -256,7 +246,6 @@ def _bbox_match(polygons: list[str], bbox_tuple) -> bool | None:
     minlon, minlat, maxlon, maxlat = bbox_tuple
     bb = box(minlon, minlat, maxlon, maxlat)
 
-    # If any polygon intersects, treat as match
     for pstr in polygons:
         try:
             poly = _polygon_string_to_shapely(pstr)
@@ -267,26 +256,17 @@ def _bbox_match(polygons: list[str], bbox_tuple) -> bool | None:
 
     return False
 
-def _parse_dt(s: str | None):
-    if not s:
-        return None
-    s = s.strip()
-    if s.endswith("Z"):
-        s = s[:-1] + "+00:00"
-    dt = datetime.fromisoformat(s)
-    if dt.tzinfo is None:
-        dt = dt.replace(tzinfo=timezone.utc)
-    return dt.astimezone(timezone.utc)
 
-def _overlaps(start, end, onset, expires):
-    # If no filtering requested
+def _overlaps(start: datetime | None, end: datetime | None, onset: datetime | None, expires: datetime | None) -> bool:
+    """
+    Keep CAP alert if hazard window overlaps requested [start, end].
+    """
     if start is None and end is None:
         return True
-    # If CAP doesn't have hazard times, keep it (or drop if you prefer strict)
     if onset is None and expires is None:
+        # if CAP doesn't include hazard timing, keep it (safe default)
         return True
 
-    # Use sent as fallback if onset/expires missing
     o = onset or expires
     x = expires or onset
     if o is None or x is None:
@@ -298,59 +278,79 @@ def _overlaps(start, end, onset, expires):
         return False
     return True
 
-def run(
-    feed_key: str,
-    max_new: int,
-    raw_dir: str,
-    out_dir: str,
-    state_path: str,
-    start: datetime | None,
-    end: datetime | None,
-    bbox_tuple,
-    timeout: int = 30,
-    *args
-) -> pd.DataFrame:
-    ensure_dir(raw_dir)
-    ensure_dir(out_dir)
 
-    state = _load_state(state_path)
+@dataclass
+class CapConfig:
+    feed_key: str
+    max_new: int
+    raw_dir: str
+    out_dir: str
+    state_path: str
+    timeout: int
+    reprocess: bool
+    time_field: str
+    start: datetime | None
+    end: datetime | None
+    bbox_tuple: tuple | None
+
+
+def run(cfg: CapConfig) -> pd.DataFrame:
+    ensure_dir(cfg.raw_dir)
+    ensure_dir(cfg.out_dir)
+
+    state = _load_state(cfg.state_path)
     seen = set(state.get("seen_xml_urls", []))
 
-    feed_url = FEEDS[feed_key]
-    atom = _get(feed_url, timeout=timeout)
+    feed_url = FEEDS[cfg.feed_key]
+    atom = _get(feed_url, timeout=cfg.timeout)
     xml_urls = extract_cap_xml_urls_from_atom(atom)
 
-    if args.reprocess:
-        new_urls = xml_urls[:max_new]
+    if cfg.reprocess:
+        candidate_urls = xml_urls[:cfg.max_new]
     else:
-        new_urls = [u for u in xml_urls if u not in seen][:max_new]
-    print(f"[cap] feed={feed_key} urls_in_feed={len(xml_urls)} new_candidates={len(new_urls)}")
+        candidate_urls = [u for u in xml_urls if u not in seen][:cfg.max_new]
+
+    print(f"[cap] feed={cfg.feed_key} urls_in_feed={len(xml_urls)} candidates={len(candidate_urls)} reprocess={cfg.reprocess}")
 
     rows = []
     kept = 0
-    for i, url in enumerate(new_urls, 1):
-        xml = _get(url, timeout=timeout)
+    for i, url in enumerate(candidate_urls, 1):
+        xml = _get(url, timeout=cfg.timeout)
         rec = parse_cap_xml(xml)
         rec["source_url"] = url
 
-        # Time filter (uses sent)
-        if not _time_in_window(rec.get("sent"), start, end):
-            seen.add(url)
-            continue
+        # Parse key times
+        sent_dt = _parse_dt(rec.get("sent"))
+        onset_dt = _parse_dt(rec.get("onset_first"))
+        expires_dt = _parse_dt(rec.get("expires_first"))
+        effective_dt = _parse_dt(rec.get("effective_first"))
+
+        # Time filter
+        if cfg.time_field == "sent":
+            if cfg.start and (sent_dt is None or sent_dt < cfg.start):
+                seen.add(url); continue
+            if cfg.end and (sent_dt is None or sent_dt > cfg.end):
+                seen.add(url); continue
+
+        elif cfg.time_field == "onset_expires":
+            if not _overlaps(cfg.start, cfg.end, onset_dt, expires_dt):
+                seen.add(url); continue
+
+        elif cfg.time_field == "effective_expires":
+            if not _overlaps(cfg.start, cfg.end, effective_dt, expires_dt):
+                seen.add(url); continue
 
         # BBox filter (best-effort using CAP polygons)
-        match = _bbox_match(rec.get("polygons") or [], bbox_tuple)
+        match = _bbox_match(rec.get("polygons") or [], cfg.bbox_tuple)
         rec["bbox_match"] = match
-        if bbox_tuple is not None:
-            # If we can evaluate and it's false, drop it.
-            # If match is None (no polygons), keep it but bbox_match=None.
+        if cfg.bbox_tuple is not None:
+            # If we can evaluate and it's false, drop it. If None, keep.
             if match is False:
-                seen.add(url)
-                continue
+                seen.add(url); continue
 
         # save raw xml
         fname = (rec.get("identifier") or f"cap_{int(time.time())}_{i}").replace(":", "_").replace("/", "_")
-        raw_path = os.path.join(raw_dir, f"{fname}.xml")
+        raw_path = os.path.join(cfg.raw_dir, f"{fname}.xml")
         with open(raw_path, "wb") as f:
             f.write(xml)
         rec["raw_path"] = raw_path
@@ -359,51 +359,56 @@ def run(
         kept += 1
         seen.add(url)
 
+    # Update state
     state["seen_xml_urls"] = sorted(seen)
-    _save_state(state_path, state)
+    _save_state(cfg.state_path, state)
 
     df = pd.DataFrame(rows)
     if not df.empty:
         # Store polygons as JSON string for parquet friendliness
-        df["polygons_json"] = df["polygons"].apply(lambda x: json.dumps(x, ensure_ascii=False) if isinstance(x, list) else None)
+        df["polygons_json"] = df["polygons"].apply(
+            lambda x: json.dumps(x, ensure_ascii=False) if isinstance(x, list) else None
+        )
         df = df.drop(columns=["polygons"])
 
-        out_path = os.path.join(out_dir, "cap_alerts_latest.parquet")
+        out_path = os.path.join(cfg.out_dir, "cap_alerts_latest.parquet")
         df.to_parquet(out_path, index=False)
-        df.to_csv(os.path.join(out_dir, "cap_alerts_latest.csv"), index=False)
+        df.to_csv(os.path.join(cfg.out_dir, "cap_alerts_latest.csv"), index=False)
 
         print(f"[cap] kept={kept} saved -> {out_path}")
-        if bbox_tuple is not None:
-            print(f"[cap] bbox filtering enabled; shapely={HAS_SHAPELY}. bbox_match True/False/None counts:")
+        if cfg.bbox_tuple is not None:
+            print(f"[cap] bbox filtering enabled; shapely={HAS_SHAPELY}. bbox_match counts:")
             print(df["bbox_match"].value_counts(dropna=False).to_string())
     else:
         print("[cap] no records kept (after filtering)")
 
     return df
 
+
 def main():
     p = argparse.ArgumentParser("FMI CAP ingest (feed-based) with local timeframe+bbox filtering")
-    p.add_argument("--feed", choices=["fi", "sv", "en"], default="en", help="Which language feed to ingest")
-    p.add_argument("--max-new", type=int, default=200, help="Max new CAP items to fetch from feed in one run")
+    p.add_argument("--feed", choices=["fi", "sv", "en"], default="en")
+    p.add_argument("--max-new", type=int, default=200)
     p.add_argument("--raw-dir", type=str, default="data/raw/cap_warnings")
     p.add_argument("--out-dir", type=str, default="data/interim/cap_parsed")
     p.add_argument("--state-path", type=str, default="data/interim/cap_parsed/cap_state.json")
     p.add_argument("--timeout", type=int, default=30)
 
     # Timeframe options
-    p.add_argument("--start", type=str, default=None, help="ISO UTC start (e.g. 2025-12-29T00:00:00Z)")
-    p.add_argument("--end", type=str, default=None, help="ISO UTC end (e.g. 2025-12-29T18:00:00Z)")
-    p.add_argument("--days", type=int, default=None, help="Convenience: keep only last N days (overrides --start/--end)")
+    p.add_argument("--start", type=str, default=None)
+    p.add_argument("--end", type=str, default=None)
+    p.add_argument("--days", type=int, default=None)
 
     # Bbox option
-    p.add_argument("--bbox", type=str, default=None, help="minLon,minLat,maxLon,maxLat (filters using CAP polygons if available)")
+    p.add_argument("--bbox", type=str, default=None)
 
-    p.add_argument("--reprocess", action="store_true",
-                   help="Reprocess feed items even if already seen (ignores state for selection).")
-
-    p.add_argument("--time-field", choices=["sent", "onset_expires", "effective_expires"],
-                   default="onset_expires",
-                   help="Which CAP time to filter on. 'onset_expires' checks overlap with hazard period.")
+    # State override + time semantics
+    p.add_argument("--reprocess", action="store_true")
+    p.add_argument(
+        "--time-field",
+        choices=["sent", "onset_expires", "effective_expires"],
+        default="onset_expires",
+    )
 
     args = p.parse_args()
 
@@ -420,19 +425,24 @@ def main():
 
     bbox_tuple = parse_bbox(args.bbox) if args.bbox else None
     if bbox_tuple is not None and not HAS_SHAPELY:
-        print("[cap] WARNING: shapely not installed; bbox filtering will be 'None' (cannot evaluate polygons).")
+        print("[cap] WARNING: shapely not installed; bbox filtering will be None (cannot evaluate polygons).")
 
-    run(
+    cfg = CapConfig(
         feed_key=args.feed,
         max_new=args.max_new,
         raw_dir=args.raw_dir,
         out_dir=args.out_dir,
         state_path=args.state_path,
+        timeout=args.timeout,
+        reprocess=args.reprocess,
+        time_field=args.time_field,
         start=start_dt,
         end=end_dt,
         bbox_tuple=bbox_tuple,
-        timeout=args.timeout,
     )
+
+    run(cfg)
+
 
 if __name__ == "__main__":
     main()
