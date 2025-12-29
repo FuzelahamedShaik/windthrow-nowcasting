@@ -1,260 +1,443 @@
+# windthrow_nowcasting/agents/fmi_ingest.py
+
 """
-fmi_ingest.py
+FMI Ingestion Agent using fmiopendata
 
-Data Ingestion Agent for FMI Open Data using the `fmiopendata` library.
+Ingests:
+  1) Observations (multipointcoverage) -> station-time records
+  2) Forecast grid (harmonie surface grid) -> cell-time-variable records + optional lat/lon arrays
 
-- Fetches grid-based HARMONIE surface forecasts:
-    stored_query_id = "fmi::forecast::harmonie::surface::grid"
-- Limits time window and bbox over Finland
-- Parses latest model run into a long-format pandas DataFrame:
-    [init_time, valid_time, level, variable, unit, lat, lon, value]
-- Saves the parsed data to:
-    data/interim/cleaned_weather/*.parquet
+Saves:
+  data/raw/fmi/observations/... (metadata.json)
+  data/interim/fmi/observations/YYYY/MM/DD/obs_*.parquet (+csv)
+  data/raw/fmi/forecast_grid/... (metadata.json)
+  data/interim/fmi/forecast_grid/init=YYYYMMDDTHH/forecast_*.parquet (+csv)
 
-Dependencies:
-    pip install fmiopendata
-    conda install eccodes -c conda-forge
-    pip install eccodes
+Usage examples:
+  # last 1 hour observations (Finland bbox)
+  python agents/data_ingestion/fmi_ingest.py obs --hours 1 --bbox 18,55,35,75
+
+  # forecast grid for today 00-18Z
+  python agents/data_ingestion/fmi_ingest.py grid --start "2025-12-29T00:00:00Z" --end "2025-12-29T18:00:00Z" --bbox 18,55,35,75
+
+  # grid: last 24 hours window relative to now (useful for development)
+  python agents/data_ingestion/fmi_ingest.py grid --recent-hours 24 --bbox 18,55,35,75
 """
 
+from __future__ import annotations
+import argparse
+import datetime as dt
+import json
 import os
-import logging
-from datetime import datetime, timedelta, timezone
-from typing import List, Optional, Tuple
-
+from dataclasses import dataclass
+from typing import Any, Dict, List, Optional, Tuple, Union
 import numpy as np
 import pandas as pd
 from fmiopendata.wfs import download_stored_query
 
+#---------------------------
+# Config paths
+# --------------------------
 
-# ---- PATHS & CONSTANTS ------------------------------------------------------
+@dataclass
+class FmiPaths:
+    raw_root: str = "data/raw/fmi"
+    interim_root: str = "data/interim/fmi"
 
-# Default bbox covering Finland (lon_min, lat_min, lon_max, lat_max)
-DEFAULT_BBOX = (19.0, 59.5, 32.0, 70.5)
+    def raw_obs_dir(self) -> str:
+        return os.path.join(self.raw_root, "observations")
 
-PARSED_DIR = "data/interim/cleaned_weather"
-os.makedirs(PARSED_DIR, exist_ok=True)
+    def raw_grid_dir(self) -> str:
+        return os.path.join(self.raw_root, "forecast_grids")
 
-STORED_QUERY_ID = "fmi::forecast::harmonie::surface::grid"
+    def interim_obs_dir(self, t:dt.datetime) -> str:
+        return os.path.join(
+            self.interim_root,
+            "observations",
+            f"{t.year:04d}", f"{t.month:02d}", f"{t.day:02d}"
+        )
 
+    def interim_grid_dir(self, init_time: dt.datetime) -> str:
+        tag = init_time.strftime("%Y%m%dT%H")
+        return os.path.join(
+            self.interim_root,
+            "forecast_grid",
+            f"init={tag}",
+        )
 
-# ---- LOGGER -----------------------------------------------------------------
+def ensure_dir (path: str) -> None:
+    os.makedirs(path, exist_ok=True)
 
-logger = logging.getLogger(__name__)
-logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(levelname)s - %(message)s")
-
-
-# ---- HELPERS ----------------------------------------------------------------
-
-def to_fmi_iso(dt: datetime) -> str:
+def iso_z(t: dt.datetime) -> str:
     """
-    Convert a datetime to FMI-compatible ISO string in UTC: YYYY-MM-DDTHH:MM:SSZ
+    Return ISO8601 string with 'Z' (UTC)
     """
-    if dt.tzinfo is None:
-        dt = dt.replace(tzinfo=timezone.utc)
-    else:
-        dt = dt.astimezone(timezone.utc)
-    return dt.strftime("%Y-%m-%dT%H:%M:%SZ")
+    if t.tzinfo is None:
+        t = t.replace(tzinfo=dt.timezone.utc)
+    t = t.astimezone(dt.timezone.utc)
+    return t.isoformat(timespec="seconds").replace("+00:00", "Z")
 
+def utc_now() -> dt.datetime:
+    return dt.datetime.now(dt.timezone.utc)
 
-def grid_to_long_dataframe(grid_obj) -> pd.DataFrame:
+# -----------------------------
+# Flatten observations
+# -----------------------------
+
+def flatten_observations_multipoint(obs) -> pd.DataFrame:
     """
-    Convert a fmiopendata Grid object to a long-format DataFrame.
+    Flatten MultiPointCoverage obs into a row-per-station-per-time table.
 
-    Structure of Grid object (see fmiopendata docs):
-        grid_obj.init_time        # model init time (datetime)
-        grid_obj.latitudes        # 2D or 1D numpy array of latitudes
-        grid_obj.longitudes       # 2D or 1D numpy array of longitudes
-        grid_obj.data[valid_time][level][dataset_name] = {
-            "data": np.ndarray,
-            "units": str
-        }
-
-    Returns
-    -------
-    df : pd.DataFrame
-        Columns: init_time, valid_time, level, variable, unit, lat, lon, value
+    obs.data structure:
+      obs.data[obstime][station_name][param] -> {"value": ..., "units": ...}
+    obs.location_metadata[station_name] -> {"fmisid":..., "latitude":..., "longitude":...}
     """
-    init_time = grid_obj.init_time
-    lats = np.array(grid_obj.latitudes)
-    lons = np.array(grid_obj.longitudes)
+    rows: List[Dict] = []
 
-    # Ensure lat/lon have the same shape as data fields
-    # If they are 1D, meshgrid them
-    if lats.ndim == 1 and lons.ndim == 1:
-        lons, lats = np.meshgrid(lons, lats)
+    for t, stations in obs.data.items():
+        # t is datetime (naive in examples) -> treat as UTC
+        if t.tzinfo is None:
+            t = t.replace(tzinfo=dt.timezone.utc)
 
-    rows = []
+        for station_name, params in stations.items():
+            meta = obs.location_metadata.get(station_name, {}) or {}
+            fmisid = meta.get("fmisid")
+            lat = meta.get("latitude")
+            lon = meta.get("longitude")
 
-    valid_times = list(grid_obj.data.keys())
-    logger.info(f"Parsing Grid object with {len(valid_times)} valid times")
-
-    for valid_time in valid_times:
-        levels_dict = grid_obj.data[valid_time]
-        for level, datasets in levels_dict.items():
-            for var_name, payload in datasets.items():
-                data_array = np.array(payload["data"], dtype=float)
-                unit = payload.get("units", None)
-
-                # Flatten everything
-                flat_lat = lats.ravel()
-                flat_lon = lons.ravel()
-                flat_val = data_array.ravel()
-
-                # Guard against mismatched shapes
-                if flat_val.shape != flat_lat.shape:
-                    logger.warning(
-                        f"Shape mismatch for {var_name} at level {level}, "
-                        f"valid_time {valid_time}: "
-                        f"lat/lon shape {flat_lat.shape}, value shape {flat_val.shape}"
-                    )
+            for param_name, payload in params.items():
+                if payload is None:
                     continue
+                val = payload.get("value")
+                unit = payload.get("units")
 
-                for lat, lon, value in zip(flat_lat, flat_lon, flat_val):
-                    if np.isnan(value):
-                        continue  # skip NaNs to save space
-                    rows.append(
-                        {
-                            "init_time": init_time,
-                            "valid_time": valid_time,
-                            "level": level,
-                            "variable": var_name,
-                            "unit": unit,
-                            "lat": float(lat),
-                            "lon": float(lon),
-                            "value": float(value),
-                        }
-                    )
+                # fmiopendata can use numpy scalars; cast to python types
+                if isinstance(val, (np.generic,)):
+                    val = val.item()
+
+                rows.append({
+                    "obs_time_utc": t.isoformat(),
+                    "station_name": station_name,
+                    "fmisid": fmisid,
+                    "lat": lat,
+                    "lon": lon,
+                    "parameter": param_name,
+                    "value": val,
+                    "unit": unit,
+                })
 
     df = pd.DataFrame(rows)
-    logger.info(f"Created DataFrame with {len(df)} rows from Grid object")
+    if not df.empty:
+        df["obs_time_utc"] = pd.to_datetime(df["obs_time_utc"], utc=True)
     return df
 
 
-# ---- MAIN AGENT CLASS -------------------------------------------------------
+# -----------------------------
+# Flatten forecast grid
+# -----------------------------
 
-class FMIIngestionAgent:
+def flatten_grid(grid_obj, keep_latlon: bool = False) -> Tuple[pd.DataFrame, Optional[np.ndarray], Optional[np.ndarray]]:
     """
-    Agent to fetch and parse FMI HARMONIE surface grid forecasts
-    using the fmiopendata library.
+    Flatten fmiopendata.grid.Grid into a long dataframe:
 
-    Typical usage:
-        agent = FMIIngestionAgent()
-        df = agent.fetch_grid_forecast_window(hours_forward=24, tag="nowcast_24h")
+    grid_obj.data[valid_time][level][dataset_name] = {"data": np.array, "units": ...}
+
+    Returns:
+      df_long with columns:
+        valid_time_utc, level, dataset, unit, i, j, value
+      plus (latitudes, longitudes) arrays if keep_latlon=True
     """
+    rows = []
+    lat_arr = getattr(grid_obj, "latitudes", None)
+    lon_arr = getattr(grid_obj, "longitudes", None)
 
-    def __init__(
-        self,
-        parsed_dir: str = PARSED_DIR,
-        bbox: Tuple[float, float, float, float] = DEFAULT_BBOX,
-    ):
-        self.parsed_dir = parsed_dir
-        self.bbox = bbox
+    for valid_time, levels in grid_obj.data.items():
+        vt = valid_time
+        if vt.tzinfo is None:
+            vt = vt.replace(tzinfo=dt.timezone.utc)
 
-    def fetch_grid_forecast(
-        self,
-        start_time: datetime,
-        end_time: datetime,
-        tag: Optional[str] = None,
-    ) -> pd.DataFrame:
-        """
-        Fetch HARMONIE surface grid data for the given time window and bbox.
+        for level, datasets in levels.items():
+            for dset_name, payload in datasets.items():
+                unit = payload.get("units")
+                data = payload.get("data")
+                if data is None:
+                    continue
 
-        Parameters
-        ----------
-        start_time : datetime (timezone-aware or naive UTC)
-        end_time   : datetime (timezone-aware or naive UTC)
-        tag        : Optional string appended to the output filename.
+                # data is 2D array [y, x] (commonly)
+                arr = np.asarray(data)
+                # iterate efficiently by flatten
+                flat = arr.ravel()
+                # indices
+                h, w = arr.shape
+                ii, jj = np.meshgrid(np.arange(w), np.arange(h))
+                ii = ii.ravel()
+                jj = jj.ravel()
 
-        Returns
-        -------
-        df : pd.DataFrame
-            Long-format grid data (init_time, valid_time, level, variable, unit, lat, lon, value).
-        """
-        start_str = to_fmi_iso(start_time)
-        end_str = to_fmi_iso(end_time)
+                for k in range(flat.shape[0]):
+                    v = flat[k]
+                    if isinstance(v, (np.generic,)):
+                        v = v.item()
+                    rows.append({
+                        "valid_time_utc": vt.isoformat(),
+                        "level": int(level),
+                        "dataset": str(dset_name),
+                        "unit": unit,
+                        "i": int(ii[k]),
+                        "j": int(jj[k]),
+                        "value": v,
+                    })
 
-        bbox_str = ",".join(map(str, self.bbox))
+    df = pd.DataFrame(rows)
+    if not df.empty:
+        df["valid_time_utc"] = pd.to_datetime(df["valid_time_utc"], utc=True)
 
-        args = [
-            f"starttime={start_str}",
-            f"endtime={end_str}",
-            f"bbox={bbox_str}",
-        ]
+    if keep_latlon:
+        return df, lat_arr, lon_arr
+    return df, None, None
 
-        logger.info(
-            f"Requesting FMI grid forecast "
-            f"stored_query_id={STORED_QUERY_ID}, "
-            f"starttime={start_str}, endtime={end_str}, bbox={bbox_str}"
-        )
+# -----------------------------
+# Ingest: observations
+# -----------------------------
 
-        model_data = download_stored_query(STORED_QUERY_ID, args=args)
+def ingest_observations(bbox: str, start: dt.datetime, end: dt.datetime, paths: FmiPaths, timeseries: bool = False) -> pd.DataFrame:
+    """
+    bbox format: "minLon,minLat,maxLon,maxLat"
+    """
+    ensure_dir(paths.raw_obs_dir())
 
-        if not model_data.data:
-            logger.warning("No grid forecast data returned from FMI for the given window.")
-            return pd.DataFrame()
+    args = [
+        f"bbox={bbox}",
+        f"starttime={iso_z(start)}",
+        f"endtime={iso_z(end)}",
+    ]
+    if timeseries:
+        args.append("timeseries=True")
 
-        # Take the latest model run
-        latest_run = max(model_data.data.keys())
-        logger.info(f"Using latest model run: {latest_run}")
+    obs = download_stored_query("fmi::observations::weather::multipointcoverage", args=args)
 
-        grid_obj = model_data.data[latest_run]
-        # Download + parse GRIB, delete file afterwards
-        grid_obj.parse(delete=True)
+    # Save raw metadata (not the whole object, but key info)
+    meta = {
+        "stored_query": "fmi::observations::weather::multipointcoverage",
+        "bbox": bbox,
+        "starttime": iso_z(start),
+        "endtime": iso_z(end),
+        "timeseries": timeseries,
+        "ingested_at_utc": iso_z(utc_now()),
+        "n_times": len(getattr(obs, "data", {}) or {}),
+        "n_stations_sample": len(next(iter(obs.data.values())).keys()) if getattr(obs, "data", None) else 0,
+    }
+    meta_path = os.path.join(paths.raw_obs_dir(), f"obs_meta_{iso_z(utc_now()).replace(':','').replace('-','')}.json")
+    with open(meta_path, "w", encoding="utf-8") as f:
+        json.dump(meta, f, ensure_ascii=False, indent=2)
 
-        df = grid_to_long_dataframe(grid_obj)
+    df = flatten_observations_multipoint(obs)
 
-        # Save to parquet
-        timestamp_str = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
-        tag_part = f"_{tag}" if tag else ""
-        out_path = os.path.join(
-            self.parsed_dir,
-            f"fmi_grid_forecast_{timestamp_str}{tag_part}.parquet",
-        )
-
-        if not df.empty:
-            df.to_parquet(out_path, index=False)
-            logger.info(f"Saved parsed grid forecast to {out_path}")
-        else:
-            logger.warning("Parsed DataFrame is empty – nothing saved.")
-
+    # Save structured
+    if df.empty:
         return df
 
-    def fetch_grid_forecast_window(
-        self,
-        hours_back: int = 0,
-        hours_forward: int = 24,
-        tag: Optional[str] = None,
-    ) -> pd.DataFrame:
-        """
-        Convenience wrapper:
-        Fetch grid forecast from now - hours_back to now + hours_forward (UTC).
+    # Partition by end date (or start date) - choose end date bucket
+    out_dir = paths.interim_obs_dir(end.astimezone(dt.timezone.utc))
+    ensure_dir(out_dir)
 
-        Example:
-            df = agent.fetch_grid_forecast_window(hours_back=0, hours_forward=24)
-        """
-        now = datetime.now(timezone.utc)
-        start = now - timedelta(hours=hours_back)
-        end = now + timedelta(hours=hours_forward)
-        return self.fetch_grid_forecast(start_time=start, end_time=end, tag=tag)
+    stamp = iso_z(utc_now()).replace(":", "").replace("-", "")
+    out_parquet = os.path.join(out_dir, f"obs_{stamp}.parquet")
+    out_csv = os.path.join(out_dir, f"obs_{stamp}.csv")
+
+    df.to_parquet(out_parquet, index=False)
+    df.to_csv(out_csv, index=False)
+
+    return df
 
 
-# ---- CLI ENTRYPOINT ---------------------------------------------------------
+# -----------------------------
+# Ingest: forecast grid
+# -----------------------------
+
+def ingest_forecast_grid(bbox: str, start: dt.datetime, end: dt.datetime, paths: FmiPaths, keep_latlon: bool = False) -> pd.DataFrame:
+    """
+    Robust ingest for FMI HARMONIE surface grid.
+    - Tries init times newest->oldest until one parses with valid times
+    - Emits diagnostics so you can see what's going on
+    """
+    ensure_dir(paths.raw_grid_dir())
+
+    args = [
+        f"starttime={iso_z(start)}",
+        f"endtime={iso_z(end)}",
+        f"bbox={bbox}",
+    ]
+
+    model_data = download_stored_query("fmi::forecast::harmonie::surface::grid", args=args)
+
+    # model_data.data keys are init times
+    init_times = sorted(model_data.data.keys())
+    print(f"[grid] init_times returned: {[t.isoformat() for t in init_times]}")
+
+    if not init_times:
+        print("[grid] No init_times returned. Try adjusting time window (e.g., 00-18Z) or bbox.")
+        return pd.DataFrame()
+
+    # Try init times from newest to oldest
+    df_long_final = pd.DataFrame()
+    chosen_init = None
+    chosen_obj = None
+    lat_arr = lon_arr = None
+
+    for init_time in sorted(init_times, reverse=True):
+        print("[grid] entering init_time loop...")
+        grid_obj = model_data.data[init_time]
+        print(f"[grid] trying init_time={init_time} url={getattr(grid_obj, 'url', None)}")
+
+        try:
+            # This is the critical step (requires eccodes)
+            grid_obj.parse(delete=True)
+        except Exception as e:
+            print(f"[grid] parse failed for init_time={init_time}: {e}")
+            continue
+
+        # After parse, grid_obj.data should have valid_time keys
+        if not getattr(grid_obj, "data", None):
+            print(f"[grid] parsed init_time={init_time} but grid_obj.data is empty")
+            continue
+
+        valid_times = sorted(grid_obj.data.keys())
+        print(f"[grid] valid_times count={len(valid_times)} first={valid_times[0]} last={valid_times[-1]}")
+
+        # Print one sample of levels + dataset names
+        try:
+            earliest = valid_times[0]
+            levels = sorted(grid_obj.data[earliest].keys())
+            print(f"[grid] levels @ earliest valid_time: {levels}")
+            for lvl in levels:
+                dsets = list(grid_obj.data[earliest][lvl].keys())
+                print(f"[grid] level {lvl} dataset sample: {dsets[:8]}")
+        except Exception as e:
+            print(f"[grid] warning: could not inspect datasets: {e}")
+
+        # Flatten
+        df_long, lat_arr, lon_arr = flatten_grid(grid_obj, keep_latlon=keep_latlon)
+
+        print(f"[grid] flattened rows={len(df_long)}")
+        if len(df_long) == 0:
+            continue
+
+        chosen_init = init_time
+        chosen_obj = grid_obj
+        df_long_final = df_long
+        break
+
+    if df_long_final.empty:
+        print("[grid] Could not parse/flatten any init time. Most common cause: eccodes not installed.")
+        return df_long_final
+
+    # Save metadata
+    meta = {
+        "stored_query": "fmi::forecast::harmonie::surface::grid",
+        "bbox": bbox,
+        "starttime": iso_z(start),
+        "endtime": iso_z(end),
+        "selected_init_time": chosen_init.isoformat() if chosen_init else None,
+        "available_init_times": [t.isoformat() for t in init_times],
+        "ingested_at_utc": iso_z(utc_now()),
+        "keep_latlon": keep_latlon,
+    }
+    meta_path = os.path.join(paths.raw_grid_dir(),
+                             f"grid_meta_{iso_z(utc_now()).replace(':', '').replace('-', '')}.json")
+    with open(meta_path, "w", encoding="utf-8") as f:
+        json.dump(meta, f, ensure_ascii=False, indent=2)
+
+    # Save structured outputs partitioned by init time
+    out_dir = paths.interim_grid_dir(
+        chosen_init.replace(tzinfo=dt.timezone.utc) if chosen_init.tzinfo is None else chosen_init)
+    ensure_dir(out_dir)
+
+    stamp = iso_z(utc_now()).replace(":", "").replace("-", "")
+    out_parquet = os.path.join(out_dir, f"forecast_{stamp}.parquet")
+    out_csv = os.path.join(out_dir, f"forecast_{stamp}.csv")
+
+    df_long_final.to_parquet(out_parquet, index=False)
+    df_long_final.to_csv(out_csv, index=False)
+
+    if keep_latlon and lat_arr is not None and lon_arr is not None:
+        np.save(os.path.join(out_dir, "latitudes.npy"), lat_arr)
+        np.save(os.path.join(out_dir, "longitudes.npy"), lon_arr)
+
+    print(f"[grid] saved parquet: {out_parquet}")
+    return df_long_final
+
+
+# -----------------------------
+# CLI
+# -----------------------------
+
+def parse_bbox(s: str) -> str:
+    # accept "18,55,35,75"
+    parts = [p.strip() for p in s.split(",")]
+    if len(parts) != 4:
+        raise argparse.ArgumentTypeError("bbox must be 'minLon,minLat,maxLon,maxLat'")
+    return ",".join(parts)
+
+
+def parse_iso(s: str) -> dt.datetime:
+    # Accept "YYYY-MM-DDTHH:MM:SSZ" or without Z
+    s = s.strip()
+    if s.endswith("Z"):
+        s = s.replace("Z", "+00:00")
+    t = dt.datetime.fromisoformat(s)
+    if t.tzinfo is None:
+        t = t.replace(tzinfo=dt.timezone.utc)
+    return t.astimezone(dt.timezone.utc)
+
+
+def main():
+    parser = argparse.ArgumentParser("FMI ingestion agent (obs + forecast grid)")
+    sub = parser.add_subparsers(dest="cmd", required=True)
+
+    p_obs = sub.add_parser("obs", help="Ingest observations multipointcoverage")
+    p_obs.add_argument("--bbox", type=parse_bbox, default="18,55,35,75")
+    p_obs.add_argument("--hours", type=int, default=1, help="Lookback window in hours")
+    p_obs.add_argument("--timeseries", action="store_true", help="Request timeseries=True from FMI")
+    p_obs.add_argument("--raw-root", type=str, default="data/raw/fmi")
+    p_obs.add_argument("--interim-root", type=str, default="data/interim/fmi")
+
+    p_grid = sub.add_parser("grid", help="Ingest forecast grid (harmonie surface grid)")
+    p_grid.add_argument("--bbox", type=parse_bbox, default="18,55,35,75")
+    p_grid.add_argument("--start", type=str, default=None, help="ISO start (e.g. 2025-12-29T00:00:00Z)")
+    p_grid.add_argument("--end", type=str, default=None, help="ISO end (e.g. 2025-12-29T18:00:00Z)")
+    p_grid.add_argument("--recent-hours", type=int, default=None, help="If set, fetch (now-recent_hours .. now)")
+    p_grid.add_argument("--keep-latlon", action="store_true", help="Save lat/lon arrays as .npy")
+    p_grid.add_argument("--raw-root", type=str, default="data/raw/fmi")
+    p_grid.add_argument("--interim-root", type=str, default="data/interim/fmi")
+
+    args = parser.parse_args()
+    paths = FmiPaths(raw_root=args.raw_root, interim_root=args.interim_root)
+
+    if args.cmd == "obs":
+        end = utc_now()
+        start = end - dt.timedelta(hours=args.hours)
+        df = ingest_observations(args.bbox, start, end, paths, timeseries=args.timeseries)
+        print(f"[obs] rows={len(df)} bbox={args.bbox} start={iso_z(start)} end={iso_z(end)}")
+
+    elif args.cmd == "grid":
+        if args.recent_hours is not None:
+            end = utc_now()
+            start = end - dt.timedelta(hours=args.recent_hours)
+        else:
+            if not args.start or not args.end:
+                raise SystemExit("grid requires either --recent-hours or both --start and --end")
+            start = parse_iso(args.start)
+            end = parse_iso(args.end)
+
+        df = ingest_forecast_grid(args.bbox, start, end, paths, keep_latlon=args.keep_latlon)
+        if df is None:
+            print(f"[grid] rows=0 (df=None) bbox={args.bbox} start={iso_z(start)} end={iso_z(end)}")
+        else:
+            print(f"[grid] rows={len(df)} bbox={args.bbox} start={iso_z(start)} end={iso_z(end)}")
+
+    else:
+        raise SystemExit("Unknown command")
+
 
 if __name__ == "__main__":
-    """
-    Example CLI usage:
-        python agents/data_ingestion/fmi_ingest.py
-    """
-    agent = FMIIngestionAgent()
-
-    df = agent.fetch_grid_forecast_window(
-        hours_back=0,
-        hours_forward=24,
-        tag="nowcasting_24h",
-    )
-
-    if df.empty:
-        logger.info("FMIIngestionAgent finished, but no data were parsed.")
-    else:
-        logger.info(f"FMIIngestionAgent finished, rows: {len(df)}")
+    main()

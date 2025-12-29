@@ -92,7 +92,7 @@ def run_pipeline(grid, forest, weather, cap_sev):
 #     return fig
 
 # ---------------- UI ----------------
-st.title("🌲 Windthrow Nowcasting Demo (Dummy Data + LightGBM + MAS Triggers)")
+st.title("🌲 Windthrow Nowcasting Demo")
 
 with st.sidebar:
     st.header("Controls")
